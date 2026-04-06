@@ -3,3 +3,6 @@
 
 
 =IF(DATE(2000+VALUE(LEFT(A2,FIND(".",A2)-1)),VALUE(MID(A2,FIND(".",A2)+1,FIND(".",A2,FIND(".",A2)+1)-FIND(".",A2)-1)),1)<EDATE(TODAY(),-8),"Older
+
+
+=IF(DATE(2000+VALUE(LEFT(A2,FIND(".",A2)-1)),VALUE(MID(A2,FIND(".",A2)+1,FIND(".",A2,FIND(".",A2)+1)-FIND(".",A2)-1)),1)<EDATE(TODAY(),-8),"Older than 8 months","Within 8 months")
