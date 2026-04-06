@@ -12,3 +12,6 @@
 
 
 =COUNTIF(B2:B10000,"Older than 8 months")/COUNTA(A2:A10000)
+
+
+=COUNTIF(B2:B10000,"Older than 8 months")/COUNTA(A2:A10000)
