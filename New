@@ -1,4 +1,3 @@
-
 <#
 .SYNOPSIS
     CyberArk EPM - Showcase Dashboard Export (Script 3 of 3) - UPDATED
@@ -188,6 +187,8 @@ function Get-AgentVersionCompliance {
     }
     catch { return "Non-Compliant" }
 }
+
+function Get-LastSeenBucket {
     param([int]$DaysSince)
     if ($DaysSince -le 7)  { return "0-7d" }
     if ($DaysSince -le 14) { return "8-14d" }
