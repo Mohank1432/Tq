@@ -1,0 +1,9 @@
+document.querySelectorAll('tr').length
+
+document.querySelectorAll('[class*="row"]').length
+
+document.querySelector('table') ? document.querySelector('table').innerHTML.substring(0, 2000) : 'no table found'
+
+document.querySelector('[class*="grid"]') ? document.querySelector('[class*="grid"]').innerHTML.substring(0, 2000) : document.querySelector('[class*="computer"]') ? document.querySelector('[class*="computer"]').innerHTML.substring(0, 2000) : 'nothing found - try next'
+
+[...new Set([...document.querySelectorAll('*')].map(e => e.className).filter(c => typeof c === 'string' && c.length > 0))].join('\n')
