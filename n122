@@ -1,19 +1,99 @@
-document.querySelectorAll('tr').length
+(function () {
 
-document.querySelectorAll('[class*="row"]').length
+    const MACHINE_LIST = `
+J5201603
+W2319122
+W2502956
+    `.trim();
 
-document.querySelector('table') ? document.querySelector('table').innerHTML.substring(0, 2000) : 'no table found'
+    const targetMachines = MACHINE_LIST
+        .split(/[\n,]+/)
+        .map(m => m.trim().toUpperCase())
+        .filter(m => m.length > 0);
 
-document.querySelector('[class*="grid"]') ? document.querySelector('[class*="grid"]').innerHTML.substring(0, 2000) : document.querySelector('[class*="computer"]') ? document.querySelector('[class*="computer"]').innerHTML.substring(0, 2000) : 'nothing found - try next'
+    console.log(`%c[EPM Selector] Target machines loaded: ${targetMachines.length}`, 'color: cyan; font-weight: bold');
 
-[...new Set([...document.querySelectorAll('*')].map(e => e.className).filter(c => typeof c === 'string' && c.length > 0))].join('\n')
+    const docs = [document];
+    document.querySelectorAll('iframe').forEach(iframe => {
+        try { if (iframe.contentDocument) docs.push(iframe.contentDocument); } catch (e) {}
+    });
 
-===================
+    let matched      = 0;
+    let notFound     = [...targetMachines]; 
+    let matchedNames = [];
 
-[...document.querySelectorAll('[class*="row"]')].map(e => e.className).join('\n')
+    // Helper function to simulate holding down the "Ctrl" key during a click
+    function ctrlClick(element) {
+        const event = new MouseEvent('click', {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            ctrlKey: true,  // Windows multi-select
+            metaKey: true   // Mac multi-select
+        });
+        element.dispatchEvent(event);
+    }
 
-[...document.querySelectorAll('[class*="row"]')].map(e => e.innerText.trim().substring(0, 100)).join('\n---\n')
+    docs.forEach(doc => {
+        const allElements = doc.querySelectorAll('*');
+        
+        allElements.forEach(el => {
+            if (el.children.length === 0 && el.innerText) {
+                const text = el.innerText.trim().toUpperCase();
+                
+                if (targetMachines.includes(text)) {
+                    
+                    let row = el.closest('[role="row"]') || 
+                              el.closest('[class*="row"]') || 
+                              el.closest('tr');
+                    
+                    if (!row && el.parentElement) {
+                        row = el.parentElement.closest('div') || el.parentElement;
+                    }
 
-[...document.querySelectorAll('[class*="ag-row"], [class*="cdk-row"], [class*="mat-row"], [class*="grid-row"], [class*="data-row"]')].map(e => e.className).join('\n')
+                    if (row && !matchedNames.includes(text)) {
+                        
+                        const checkbox = row.querySelector('input[type="checkbox"], [role="checkbox"], .mat-checkbox-inner-container, .p-checkbox-box');
+                        
+                        // Fire the simulated Ctrl+Click
+                        if (checkbox) {
+                            // If it's a native checkbox, ensure it's not already checked before clicking
+                            if (checkbox.checked === undefined || !checkbox.checked) {
+                                ctrlClick(checkbox);
+                            }
+                        } else {
+                            // Fallback to clicking the row itself with Ctrl held down
+                            ctrlClick(row);
+                        }
 
-document.querySelector('main, [class*="content"], [class*="computers"], [class*="endpoint"]')?.innerHTML.substring(0, 3000)
+                        row.style.borderLeft = '4px solid #00ff00';
+                        row.style.backgroundColor = 'rgba(0, 255, 0, 0.15)';
+
+                        matched++;
+                        matchedNames.push(text);
+                        notFound = notFound.filter(n => n !== text);
+                    }
+                }
+            }
+        });
+    });
+
+    console.log(`\n%c========== EPM SELECTOR SUMMARY ==========`, 'color: cyan; font-weight: bold; font-size: 14px');
+    console.log(`%cTotal in your list  : ${targetMachines.length}`, 'color: white');
+    console.log(`%cMatched & Selected  : ${matched}`,                'color: lightgreen; font-weight: bold');
+    console.log(`%cNot found on page   : ${notFound.length}`,        notFound.length > 0 ? 'color: orange; font-weight: bold' : 'color: lightgreen');
+
+    if (matchedNames.length > 0) {
+        console.log(`\n%cSelected machines:`, 'color: lightgreen');
+        matchedNames.forEach(n => console.log(`  ✓ ${n}`));
+    }
+
+    if (notFound.length > 0) {
+        console.warn(`\n%cNot found (They may be off-screen or on another page):`, 'color: orange; font-weight: bold');
+        notFound.forEach(n => console.warn(`  ✗ ${n}`));
+    }
+
+    console.log(`\n%c==========================================`, 'color: cyan; font-weight: bold');
+    console.log(`%cDone! Now right-click any highlighted row → Assign to Group`, 'color: cyan; font-weight: bold');
+
+})();
