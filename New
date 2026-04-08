@@ -1,17 +1,597 @@
-=SUMPRODUCT((DATE(2000+VALUE(LEFT(A2:A100,FIND(".",A2:A100)-1)),VALUE(MID(A2:A100,FIND(".",A2:A100)+1,LEN(A2:A100))),1)<EDATE(TODAY(),-8))*(A2:A100<>""))/COUNTA(A2:A100)
 
+<#
+.SYNOPSIS
+    CyberArk EPM - Showcase Dashboard Export (Script 3 of 3) - UPDATED
+.DESCRIPTION
+    Independent Health Score, Connectivity Compliance and Agent Version Compliance thresholds.
+    - ComplianceGraceDays    : offline ≤ N days counts as "Active - Compliant"
+    - HealthGraceDays        : offline ≤ N days counts as HealthStatus = "Healthy"
+    - HealthStaleDays        : offline > N days counts as HealthStatus = "Unhealthy"
+    - AgentComplianceMonths  : agent version older than N months = "Non-Compliant"
+    - Devices in the HealthGraceDays..HealthStaleDays gap = "Healthy - Prolonged"
+    HealthScorePct       = (Healthy + Healthy-Prolonged) / Total
+    CompliancePct        = Compliant / Total  (connectivity grace, unchanged)
+    AgentCompliancePct   = AgentVersionCompliant="Compliant" / Total (version age based)
+    New columns: HealthStatus, AgentVersionCompliant (Endpoints CSV)
+                 HealthyCount, HealthyProlongedCount, UnhealthyCount,
+                 AgentVersionCompliantCount, AgentVersionNonCompliantCount,
+                 AgentCompliancePct, ShortSetName (SetSummary CSV)
+#>
 
+# ============================================================
+# USER-CONFIGURABLE VARIABLES
+# ============================================================
+$Username = "XXXXXXXXXXX@XXXXXXXXXXXXX.XXX"  
+$AppId     = 'EPM_PowerShell_Script'
+$EpmAuthServer = 'XXXX.epm.cyberark.com'
+$EpmDataServer = 'XXXXXXXXX.epm.cyberark.com'
 
-=IF(DATE(2000+VALUE(LEFT(A2,FIND(".",A2)-1)),VALUE(MID(A2,FIND(".",A2)+1,FIND(".",A2,FIND(".",A2)+1)-FIND(".",A2)-1)),1)<EDATE(TODAY(),-8),"Older
+# Thresholds
+$StaleDaysThreshold      = 21                   # Days after which endpoint becomes "Stale - Cleanup Candidate" (Compliance)
+$ComplianceGraceDays     = 14                   # ← EDIT HERE: Grace period for Compliance % (on-leave tolerance)
+$HealthGraceDays         = 14                   # ← EDIT HERE: Offline ≤ N days = HealthStatus "Healthy"
+$HealthStaleDays         = 21                   # ← EDIT HERE: Offline > N days = HealthStatus "Unhealthy" (gap = "Healthy - Prolonged")
+$AgentComplianceMonths   = 8                    # ← EDIT HERE: Agent version older than N months = "Non-Compliant" (e.g. change to 6)
+$LatestAgentVersion      = "26.2.1.2973"
 
+$LicenseWindowDays    = 7
+$FPSetPatterns        = @("_FP", "DETECT", "_Testing", "Shabbir")
+$CRSetPatterns        = @("_CR")
+$FPAllocatedLicenses  = 11000
+$CRAllocatedLicenses  = 70000
 
-=IF(DATE(2000+VALUE(LEFT(A2,FIND(".",A2)-1)),VALUE(MID(A2,FIND(".",A2)+1,FIND(".",A2,FIND(".",A2)+1)-FIND(".",A2)-1)),1)<EDATE(TODAY(),-8),"Older than 8 months","Within 8 months")
+# RAG THRESHOLDS
+$AmberThresholdPct    = 70
+$RedThresholdPct      = 90
 
+# RATE LIMIT CONTROLS
+$PageSize             = 1000
+$MaxRetries           = 3
+$ThrottleMs           = 300
 
-=SUMPRODUCT((DATE(2000+VALUE(LEFT(A2:A10000,FIND(".",A2:A10000)-1)),VALUE(MID(A2:A10000,FIND(".",A2:A10000)+1,FIND(".",A2:A10000,FIND(".",A2:A10000)+1)-FIND(".",A2:A10000)-1)),1)<EDATE(TODAY(),-8))*(A2:A10000<>""))/COUNTA(A2:A10000)
+# Output paths
+$ScriptDir  = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$ExportRoot = Join-Path $ScriptDir "PowerBI_Export"
+$LatestDir  = Join-Path $ExportRoot "Latest"
+$ArchiveDir = Join-Path $ExportRoot "Archive"
+$LogDir     = Join-Path $ExportRoot "Logs"
 
+# ============================================================
+# INITIALISE
+# ============================================================
+foreach ($d in @($LatestDir, $ArchiveDir, $LogDir)) {
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+}
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-=COUNTIF(B2:B10000,"Older than 8 months")/COUNTA(A2:A10000)
+$ScriptRunDate  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+$ArchivePrefix  = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$LogTimestamp   = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$LogFile        = Join-Path $LogDir "EPM_Showcase_${LogTimestamp}.log"
 
+# START LOG FILE
+@"
+================================================================================
+ CyberArk EPM - Showcase Dashboard Export Log
+ Run Started          : $ScriptRunDate
+ ComplianceGraceDays  : $ComplianceGraceDays days (affects Compliance %)
+ StaleDaysThreshold   : $StaleDaysThreshold days
+================================================================================
+"@ | Out-File -FilePath $LogFile -Encoding UTF8
 
-=COUNTIF(B2:B10000,"Older than 8 months")/COUNTA(A2:A10000)
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+function Write-Status {
+    param([string]$Message, [string]$Color = "White")
+    $line = "$(Get-Date -Format 'HH:mm:ss') | $Message"
+    Write-Host $line -ForegroundColor $Color
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8
+}
+
+function Invoke-EpmApi {
+    param(
+        [string]$Uri,
+        [string]$Method = "Get",
+        [hashtable]$Headers,
+        [string]$Body = $null
+    )
+    for ($attempt = 1; $attempt -le $MaxRetries; $attempt++) {
+        try {
+            $params = @{ Uri = $Uri; Method = $Method; Headers = $Headers }
+            if ($Body) { $params.Body = $Body; $params.ContentType = "application/json" }
+            return Invoke-RestMethod @params
+        }
+        catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            if ($statusCode -eq 429 -or $statusCode -eq 403) {
+                Write-Status "[RateLimit] HTTP $statusCode — backing off 60s (attempt $attempt/$MaxRetries)..." "Yellow"
+                Start-Sleep -Seconds 60
+            }
+            elseif ($attempt -eq $MaxRetries) { throw $_ }
+            else { Start-Sleep -Seconds ($attempt * 5) }
+        }
+    }
+}
+
+function Export-PowerBiCsv {
+    param([object[]]$Data, [string]$BaseName, [string]$FallbackHeaders = "")
+    $latestPath  = Join-Path $LatestDir  "${BaseName}.csv"
+    $archivePath = Join-Path $ArchiveDir "${ArchivePrefix}_${BaseName}.csv"
+
+    if (-not $Data -or $Data.Count -eq 0) {
+        $headerLine = $FallbackHeaders
+        Set-Content -Path $latestPath  -Value $headerLine -Encoding UTF8
+        Set-Content -Path $archivePath -Value $headerLine -Encoding UTF8
+        Write-Status "[Export] $BaseName — 0 rows (header-only CSV written)" "Yellow"
+    } else {
+        $Data | Export-Csv -Path $latestPath  -NoTypeInformation -Encoding UTF8 -Force
+        $Data | Export-Csv -Path $archivePath -NoTypeInformation -Encoding UTF8 -Force
+        Write-Status "[Export] $BaseName — $($Data.Count) rows -> Latest\ + Archive\" "Green"
+    }
+}
+
+# UPDATED Get-EndpointClassification
+function Get-EndpointClassification {
+    param([string]$Status, [string]$Version, [int]$DaysSince, [int]$GraceDays)
+
+    if ($Status -eq 'Alive') {
+        if ($Version -and ([version]$Version) -lt ([version]$LatestAgentVersion)) { 
+            return "Active - Outdated Agent" 
+        }
+        return "Active - Compliant"
+    }
+
+    # Disconnected logic with grace period
+    if ($DaysSince -le $GraceDays) { 
+        return "Active - Compliant"   # On-leave / short disconnect tolerance
+    }
+    if ($DaysSince -le $StaleDaysThreshold) { 
+        return "Disconnected - Prolonged (>$($GraceDays)d)" 
+    }
+    return "Stale - Cleanup Candidate"
+}
+
+# NEW: Independent Health Status — driven by HealthGraceDays / HealthStaleDays
+function Get-HealthStatus {
+    param([string]$Status, [int]$DaysSince, [int]$GraceDays, [int]$StaleDays)
+
+    if ($Status -eq 'Alive') { return "Healthy" }
+    if ($DaysSince -lt 0)    { return "Unknown" }
+
+    if ($DaysSince -le $GraceDays)  { return "Healthy" }
+    if ($DaysSince -le $StaleDays)  { return "Healthy - Prolonged" }
+    return "Unhealthy"
+}
+
+# NEW: Agent Version Compliance — driven by AgentComplianceMonths
+# Parses YY.MM from version string (e.g. 25.4.1.2973 → Apr 2025)
+# Returns "Compliant" if version is within N months, "Non-Compliant" otherwise
+function Get-AgentVersionCompliance {
+    param([string]$Version, [int]$MonthsThreshold)
+
+    if ([string]::IsNullOrWhiteSpace($Version)) { return "Non-Compliant" }
+
+    try {
+        $firstDot  = $Version.IndexOf('.')
+        $secondDot = $Version.IndexOf('.', $firstDot + 1)
+        if ($firstDot -lt 0 -or $secondDot -lt 0) { return "Non-Compliant" }
+
+        $year  = [int]("20" + $Version.Substring(0, $firstDot))
+        $month = [int]$Version.Substring($firstDot + 1, $secondDot - $firstDot - 1)
+
+        $versionDate  = [datetime]::new($year, $month, 1)
+        $cutoffDate   = (Get-Date).AddMonths(-$MonthsThreshold)
+
+        if ($versionDate -ge $cutoffDate) { return "Compliant" }
+        return "Non-Compliant"
+    }
+    catch { return "Non-Compliant" }
+}
+    param([int]$DaysSince)
+    if ($DaysSince -le 7)  { return "0-7d" }
+    if ($DaysSince -le 14) { return "8-14d" }
+    if ($DaysSince -le 30) { return "15-30d" }
+    if ($DaysSince -le 60) { return "31-60d" }
+    return "60d+"
+}
+
+function Get-RagStatus {
+    param([double]$UtilPct)
+    if ($UtilPct -ge $RedThresholdPct)   { return "Red" }
+    if ($UtilPct -ge $AmberThresholdPct) { return "Amber" }
+    return "Green"
+}
+
+function Test-PoolMatch {
+    param([string]$SetName, [string[]]$Patterns)
+    foreach ($p in $Patterns) { if ($SetName -match [regex]::Escape($p)) { return $true } }
+    return $false
+}
+
+function Get-LicensePool {
+    param([string]$SetName)
+    if (Test-PoolMatch $SetName $FPSetPatterns) { return "FP" }
+    if (Test-PoolMatch $SetName $CRSetPatterns) { return "CR" }
+    return "Other"
+}
+
+function Safe-String { param($v); if ($null -eq $v) { "" } else { "$v" } }
+function Safe-Date   { param($v); if ($v) { try { Get-Date $v -Format "yyyy-MM-dd HH:mm:ss" } catch { "" } } else { "" } }
+function Safe-Bool   { param($v); if ($v -eq $true) { "TRUE" } else { "FALSE" } }
+
+# ============================================================
+# AUTHENTICATE
+# ============================================================
+Write-Status "[Auth] Enter password for: $Username" "Cyan"
+$SecurePassword = Read-Host -AsSecureString "Password"
+$BSTR           = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
+$PlainPassword  = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
+[System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($BSTR)
+
+$LogonBody  = @{ ApplicationID = $AppId; Username = $Username; Password = $PlainPassword } | ConvertTo-Json
+$PlainPassword = $null
+
+try {
+    Write-Status "[Auth] Authenticating..." "Cyan"
+    $AuthResponse = Invoke-RestMethod -Uri "https://$EpmAuthServer/EPM/API/Auth/EPM/Logon" `
+                        -Method Post -Headers @{ "Content-Type" = "application/json" } -Body $LogonBody
+    $Token = $AuthResponse.EPMAuthenticationResult
+    Write-Status "[Auth] Success." "Green"
+}
+catch { Write-Status "[Auth] FAILED: $_" "Red"; exit 1 }
+
+$Headers = @{ "Authorization" = "Basic $Token"; "Content-Type" = "application/json" }
+
+# ============================================================
+# FETCH SETS
+# ============================================================
+Write-Status "[Sets] Fetching EPM Sets..." "Cyan"
+$AllSets   = [System.Collections.ArrayList]::new()
+$setOffset = 0
+do {
+    $resp = Invoke-EpmApi -Uri "https://$EpmDataServer/EPM/API/Sets?Offset=$setOffset&Limit=$PageSize" -Headers $Headers
+    if ($resp.Sets) { foreach ($s in $resp.Sets) { [void]$AllSets.Add($s) } }
+    $setOffset += $PageSize
+} while ($setOffset -lt $resp.SetsCount)
+Write-Status "[Sets] Found $($AllSets.Count) sets." "Green"
+
+# ============================================================
+# MODULE 1 — ENDPOINTS
+# ============================================================
+Write-Status "[M1] Scanning endpoints..." "Cyan"
+$MasterEndpoints = [System.Collections.ArrayList]::new()
+$now = Get-Date
+
+foreach ($set in $AllSets) {
+    $pool   = Get-LicensePool $set.Name
+    $offset = 0; $total = 0
+    do {
+        try {
+            $resp  = Invoke-EpmApi -Uri "https://$EpmDataServer/EPM/API/Sets/$($set.Id)/Computers?Offset=$offset&Limit=$PageSize" -Headers $Headers
+            $total = $resp.TotalCount
+
+            foreach ($comp in $resp.Computers) {
+                $daysSince = -1
+                if ($comp.LastSeen) {
+                    try { $daysSince = [math]::Floor(($now - [datetime]$comp.LastSeen).TotalDays) } catch {}
+                }
+
+                $agentOutdated = $false
+                if ($comp.AgentVersion) {
+                    try { $agentOutdated = ([version]$comp.AgentVersion) -lt ([version]$LatestAgentVersion) } catch {}
+                }
+
+                $classification      = Get-EndpointClassification -Status $comp.Status -Version $comp.AgentVersion -DaysSince $daysSince -GraceDays $ComplianceGraceDays
+                $healthStatus        = Get-HealthStatus -Status $comp.Status -DaysSince $daysSince -GraceDays $HealthGraceDays -StaleDays $HealthStaleDays
+                $agentVerCompliant   = Get-AgentVersionCompliance -Version $comp.AgentVersion -MonthsThreshold $AgentComplianceMonths
+
+                $licenseCounted = if ($daysSince -ge 0 -and $daysSince -le $LicenseWindowDays) { "TRUE" } elseif ($daysSince -lt 0) { "UNKNOWN" } else { "FALSE" }
+                $lastSeenBucket = if ($daysSince -ge 0) { Get-LastSeenBucket -DaysSince $daysSince } else { "Unknown" }
+
+                [void]$MasterEndpoints.Add([PSCustomObject]@{
+                    ComputerName              = Safe-String $comp.ComputerName
+                    AgentId                   = Safe-String $comp.AgentId
+                    SetName                   = $set.Name
+                    SetId                     = $set.Id
+                    LicensePool               = $pool
+                    Platform                  = Safe-String $comp.Platform
+                    OSVersion                 = Safe-String $comp.OSVersion
+                    AgentVersion              = Safe-String $comp.AgentVersion
+                    AgentOutdated             = Safe-Bool $agentOutdated
+                    LatestAgentVersion        = $LatestAgentVersion
+                    Status                    = Safe-String $comp.Status
+                    IsAlive                   = if ($comp.Status -eq "Alive") { "TRUE" } else { "FALSE" }
+                    EndpointClassification    = $classification
+                    IsStale                   = if ($classification -eq "Stale - Cleanup Candidate") { "TRUE" } else { "FALSE" }
+                    HealthStatus              = $healthStatus
+                    AgentVersionCompliant     = $agentVerCompliant
+                    LastSeen                  = Safe-Date $comp.LastSeen
+                    DaysDisconnected          = if ($daysSince -ge 0) { $daysSince } else { 0 }
+                    LastSeenBucket            = $lastSeenBucket
+                    LoggedInUser              = Safe-String $comp.LoggedIn
+                    CyberArkLicenseCounted    = $licenseCounted
+                    LicenseWindowDays         = $LicenseWindowDays
+                    ScriptRunDate             = $ScriptRunDate
+                })
+            }
+            $offset += $PageSize
+        }
+        catch { Write-Status "[M1] Error on set '$($set.Name)': $_" "Red"; break }
+    } while ($offset -lt $total)
+
+    Start-Sleep -Milliseconds $ThrottleMs
+}
+Write-Status "[M1] Collected $($MasterEndpoints.Count) endpoints." "Green"
+
+$h_Endpoints = "ComputerName,AgentId,SetName,SetId,LicensePool,Platform,OSVersion,AgentVersion,AgentOutdated,LatestAgentVersion,Status,IsAlive,EndpointClassification,IsStale,HealthStatus,AgentVersionCompliant,LastSeen,DaysDisconnected,LastSeenBucket,LoggedInUser,CyberArkLicenseCounted,LicenseWindowDays,ScriptRunDate"
+Export-PowerBiCsv -Data $MasterEndpoints -BaseName "Endpoints" -FallbackHeaders $h_Endpoints
+
+# ============================================================
+# MODULE 2 — AGENT VERSION DISTRIBUTION
+# ============================================================
+Write-Status "[M2] Building Agent Version distribution..." "Cyan"
+$AgentVersions = [System.Collections.ArrayList]::new()
+
+$perSetGroups = $MasterEndpoints | Group-Object SetId
+foreach ($setGrp in $perSetGroups) {
+    $setEndpoints = @($setGrp.Group)
+    $setTotal     = $setEndpoints.Count
+    $setName      = $setEndpoints[0].SetName
+    $setId        = $setGrp.Name
+    $pool         = $setEndpoints[0].LicensePool
+
+    $versionGroups = $setEndpoints | Group-Object AgentVersion
+    foreach ($verGrp in $versionGroups) {
+        $ver      = $verGrp.Name
+        $count    = $verGrp.Group.Count
+        $isLatest = ($ver -eq $LatestAgentVersion)
+        $pctOfSet = if ($setTotal -gt 0) { [math]::Round(($count / $setTotal) * 100, 1) } else { 0 }
+
+        [void]$AgentVersions.Add([PSCustomObject]@{
+            SetName            = $setName
+            SetId              = $setId
+            LicensePool        = $pool
+            AgentVersion       = $ver
+            EndpointCount      = $count
+            PctOfSet           = $pctOfSet
+            IsLatestVersion    = Safe-Bool $isLatest
+            LatestAgentVersion = $LatestAgentVersion
+            ScriptRunDate      = $ScriptRunDate
+        })
+    }
+}
+
+# Global
+$globalTotal  = $MasterEndpoints.Count
+$globalGroups = $MasterEndpoints | Group-Object AgentVersion
+foreach ($verGrp in $globalGroups) {
+    $ver       = $verGrp.Name
+    $count     = $verGrp.Group.Count
+    $isLatest  = ($ver -eq $LatestAgentVersion)
+    $pctGlobal = if ($globalTotal -gt 0) { [math]::Round(($count / $globalTotal) * 100, 1) } else { 0 }
+
+    [void]$AgentVersions.Add([PSCustomObject]@{
+        SetName            = "_ALL_SETS"
+        SetId              = "_ALL"
+        LicensePool        = "ALL"
+        AgentVersion       = $ver
+        EndpointCount      = $count
+        PctOfSet           = $pctGlobal
+        IsLatestVersion    = Safe-Bool $isLatest
+        LatestAgentVersion = $LatestAgentVersion
+        ScriptRunDate      = $ScriptRunDate
+    })
+}
+Write-Status "[M2] Agent version rows built: $($AgentVersions.Count)" "Green"
+
+$h_AgentVersions = "SetName,SetId,LicensePool,AgentVersion,EndpointCount,PctOfSet,IsLatestVersion,LatestAgentVersion,ScriptRunDate"
+Export-PowerBiCsv -Data $AgentVersions -BaseName "AgentVersions" -FallbackHeaders $h_AgentVersions
+
+# ============================================================
+# MODULE 3 — SET SUMMARY (optimized)
+# ============================================================
+Write-Status "[M3] Building Set Summary..." "Cyan"
+$SetSummary = [System.Collections.ArrayList]::new()
+$setGroups = $MasterEndpoints | Group-Object SetId
+
+foreach ($set in $AllSets) {
+    $sEPs = ($setGroups | Where-Object Name -eq $set.Id).Group
+    if (-not $sEPs) { $sEPs = @() }
+
+    $pool      = Get-LicensePool $set.Name
+    $alloc     = if ($pool -eq "FP") { $FPAllocatedLicenses } elseif ($pool -eq "CR") { $CRAllocatedLicenses } else { 0 }
+    $total     = $sEPs.Count
+    $alive     = ($sEPs | Where-Object { $_.IsAlive -eq "TRUE" }).Count
+    $stale     = ($sEPs | Where-Object { $_.IsStale -eq "TRUE" }).Count
+    $outdated  = ($sEPs | Where-Object { $_.AgentOutdated -eq "TRUE" }).Count
+    $licensed  = ($sEPs | Where-Object { $_.CyberArkLicenseCounted -eq "TRUE" }).Count
+    $compliant        = ($sEPs | Where-Object { $_.EndpointClassification -eq "Active - Compliant" }).Count
+
+    # Health counts — independent of Compliance, driven by HealthGraceDays / HealthStaleDays
+    $healthyCount        = ($sEPs | Where-Object { $_.HealthStatus -eq "Healthy" }).Count
+    $healthyProlCount    = ($sEPs | Where-Object { $_.HealthStatus -eq "Healthy - Prolonged" }).Count
+    $unhealthyCount      = ($sEPs | Where-Object { $_.HealthStatus -eq "Unhealthy" }).Count
+
+    # Agent Version Compliance counts — driven by AgentComplianceMonths
+    $agentCompliantCount    = ($sEPs | Where-Object { $_.AgentVersionCompliant -eq "Compliant" }).Count
+    $agentNonCompliantCount = ($sEPs | Where-Object { $_.AgentVersionCompliant -eq "Non-Compliant" }).Count
+
+    # Health Score = Healthy + Healthy-Prolonged (grace-inclusive)
+    # Compliance % = Compliant only (driven by ComplianceGraceDays)
+    # Agent Compliance % = version age based (driven by AgentComplianceMonths)
+    $healthScorePct      = if ($total -gt 0) { [math]::Round((($healthyCount + $healthyProlCount) / $total) * 100, 1) } else { 0 }
+    $compliancePct       = if ($total -gt 0) { [math]::Round(($compliant / $total) * 100, 1) } else { 0 }
+    $agentCompliancePct  = if ($total -gt 0) { [math]::Round(($agentCompliantCount / $total) * 100, 1) } else { 0 }
+    $licUtilPct          = if ($alloc -gt 0) { [math]::Round(($licensed / $alloc) * 100, 1) } else { 0 }
+
+    # ShortSetName — left 20 characters for Power BI axis labels (fixes calculated column refresh issue)
+    $shortSetName = if ($set.Name.Length -gt 20) { $set.Name.Substring(0, 20) } else { $set.Name }
+
+    $winCount   = ($sEPs | Where-Object { $_.Platform -match "Win" }).Count
+    $macCount   = ($sEPs | Where-Object { $_.Platform -match "Mac|Darwin|macOS" }).Count
+    $linuxCount = ($sEPs | Where-Object { $_.Platform -match "Linux" }).Count
+    $otherCount = $total - $winCount - $macCount - $linuxCount
+
+    $bucket_0_7   = ($sEPs | Where-Object { $_.LastSeenBucket -eq "0-7d" }).Count
+    $bucket_8_14  = ($sEPs | Where-Object { $_.LastSeenBucket -eq "8-14d" }).Count
+    $bucket_15_30 = ($sEPs | Where-Object { $_.LastSeenBucket -eq "15-30d" }).Count
+    $bucket_31_60 = ($sEPs | Where-Object { $_.LastSeenBucket -eq "31-60d" }).Count
+    $bucket_60p   = ($sEPs | Where-Object { $_.LastSeenBucket -eq "60d+" }).Count
+
+    [void]$SetSummary.Add([PSCustomObject]@{
+        SetName                      = $set.Name
+        ShortSetName                 = $shortSetName
+        SetId                        = $set.Id
+        LicensePool                  = $pool
+        AllocatedLicenses            = $alloc
+        IsEmptySet                   = if ($total -eq 0) { "TRUE" } else { "FALSE" }
+        TotalEndpoints               = $total
+        AliveCount                   = $alive
+        DisconnectedCount            = $total - $alive
+        StaleCount                   = $stale
+        OutdatedAgentCount           = $outdated
+        CompliantCount               = $compliant
+        NonCompliantCount            = $total - $compliant
+        HealthyCount                 = $healthyCount
+        HealthyProlongedCount        = $healthyProlCount
+        UnhealthyCount               = $unhealthyCount
+        AgentVersionCompliantCount   = $agentCompliantCount
+        AgentVersionNonCompliantCount = $agentNonCompliantCount
+        OfficialLicenseCounted       = $licensed
+        HealthScorePct               = $healthScorePct
+        CompliancePct                = $compliancePct
+        AgentCompliancePct           = $agentCompliancePct
+        LicenseUtilizationPct        = $licUtilPct
+        WindowsCount                 = $winCount
+        MacCount                     = $macCount
+        LinuxCount                   = $linuxCount
+        OtherPlatformCount           = $otherCount
+        LastSeen_0_7d                = $bucket_0_7
+        LastSeen_8_14d               = $bucket_8_14
+        LastSeen_15_30d              = $bucket_15_30
+        LastSeen_31_60d              = $bucket_31_60
+        LastSeen_60dPlus             = $bucket_60p
+        ScriptRunDate                = $ScriptRunDate
+    })
+}
+Write-Status "[M3] Set Summary rows built: $($SetSummary.Count)" "Green"
+
+$h_SetSummary = "SetName,ShortSetName,SetId,LicensePool,AllocatedLicenses,IsEmptySet,TotalEndpoints,AliveCount,DisconnectedCount,StaleCount,OutdatedAgentCount,CompliantCount,NonCompliantCount,HealthyCount,HealthyProlongedCount,UnhealthyCount,AgentVersionCompliantCount,AgentVersionNonCompliantCount,OfficialLicenseCounted,HealthScorePct,CompliancePct,AgentCompliancePct,LicenseUtilizationPct,WindowsCount,MacCount,LinuxCount,OtherPlatformCount,LastSeen_0_7d,LastSeen_8_14d,LastSeen_15_30d,LastSeen_31_60d,LastSeen_60dPlus,ScriptRunDate"
+Export-PowerBiCsv -Data $SetSummary -BaseName "SetSummary" -FallbackHeaders $h_SetSummary
+
+# ============================================================
+# MODULE 4 — LICENSE POOLS
+# ============================================================
+Write-Status "[M4] Building License Pool table..." "Cyan"
+$LicensePools = [System.Collections.ArrayList]::new()
+
+foreach ($pool in @("FP", "CR")) {
+    $pEPs    = $MasterEndpoints | Where-Object { $_.LicensePool -eq $pool }
+    $alloc   = if ($pool -eq "FP") { $FPAllocatedLicenses } else { $CRAllocatedLicenses }
+    $total   = $pEPs.Count
+    $billed  = ($pEPs | Where-Object { $_.CyberArkLicenseCounted -eq "TRUE" }).Count
+    $ceiling = $alloc * 3
+
+    $billingUtilPct = if ($alloc -gt 0) { [math]::Round(($billed / $alloc) * 100, 1) } else { 0 }
+    $deployUtilPct  = if ($alloc -gt 0) { [math]::Round(($total / $alloc) * 100, 1) } else { 0 }
+    $headroom       = $alloc - $billed
+    $headroomPct    = if ($alloc -gt 0) { [math]::Round(($headroom / $alloc) * 100, 1) } else { 0 }
+    $ragStatus      = Get-RagStatus -UtilPct $billingUtilPct
+
+    [void]$LicensePools.Add([PSCustomObject]@{
+        LicensePool               = $pool
+        AllocatedLicenses         = $alloc
+        HardCeiling3x             = $ceiling
+        TotalDeployedAgents       = $total
+        CurrentlyBilled           = $billed
+        HeadroomLicenses          = $headroom
+        HeadroomPct               = $headroomPct
+        RemainingBeforeCeiling    = $ceiling - $total
+        DeploymentUtilizationPct  = $deployUtilPct
+        BillingUtilizationPct     = $billingUtilPct
+        RAGStatus                 = $ragStatus
+        AmberThresholdPct         = $AmberThresholdPct
+        RedThresholdPct           = $RedThresholdPct
+        ScriptRunDate             = $ScriptRunDate
+    })
+}
+Write-Status "[M4] License Pool rows built: $($LicensePools.Count)" "Green"
+
+$h_LicensePools = "LicensePool,AllocatedLicenses,HardCeiling3x,TotalDeployedAgents,CurrentlyBilled,HeadroomLicenses,HeadroomPct,RemainingBeforeCeiling,DeploymentUtilizationPct,BillingUtilizationPct,RAGStatus,AmberThresholdPct,RedThresholdPct,ScriptRunDate"
+Export-PowerBiCsv -Data $LicensePools -BaseName "LicensePools" -FallbackHeaders $h_LicensePools
+
+# ============================================================
+# MODULE 5 — DEPLOYMENT VELOCITY
+# ============================================================
+Write-Status "[M5] Building Deployment Velocity from Archive..." "Cyan"
+$DeploymentVelocity = [System.Collections.ArrayList]::new()
+
+$archiveFiles = Get-ChildItem -Path $ArchiveDir -Filter "*_Endpoints.csv" -File -ErrorAction SilentlyContinue | Sort-Object Name
+
+if ($archiveFiles.Count -lt 2) {
+    Write-Status "[M5] Not enough archive files for velocity calculation." "Yellow"
+} else {
+    $snapshots = [System.Collections.ArrayList]::new()
+    foreach ($f in $archiveFiles) {
+        $tsStr = $f.BaseName -replace "_Endpoints", ""
+        $snapDate = $null
+        try { $snapDate = [datetime]::ParseExact($tsStr, "yyyy-MM-dd_HH-mm-ss", $null) } catch { continue }
+
+        try {
+            $rows = Import-Csv -Path $f.FullName
+            $ids = [System.Collections.Generic.HashSet[string]]::new([string[]]($rows | Select-Object -ExpandProperty AgentId | Where-Object { $_ -ne "" }))
+            [void]$snapshots.Add([PSCustomObject]@{ SnapDate = $snapDate; AgentIds = $ids })
+        } catch {}
+    }
+
+    for ($i = 1; $i -lt $snapshots.Count; $i++) {
+        $prev = $snapshots[$i - 1]
+        $curr = $snapshots[$i]
+
+        $newIds = [System.Collections.Generic.HashSet[string]]::new($curr.AgentIds); $newIds.ExceptWith($prev.AgentIds)
+        $removedIds = [System.Collections.Generic.HashSet[string]]::new($prev.AgentIds); $removedIds.ExceptWith($curr.AgentIds)
+
+        $daysDiff = [math]::Round(($curr.SnapDate - $prev.SnapDate).TotalDays, 1)
+
+        [void]$DeploymentVelocity.Add([PSCustomObject]@{
+            PeriodStart        = $prev.SnapDate.ToString("yyyy-MM-dd HH:mm:ss")
+            PeriodEnd          = $curr.SnapDate.ToString("yyyy-MM-dd HH:mm:ss")
+            DaysBetweenSnaps   = $daysDiff
+            NewEndpoints       = $newIds.Count
+            RemovedEndpoints   = $removedIds.Count
+            NetChange          = $newIds.Count - $removedIds.Count
+            TotalAtPeriodEnd   = $curr.AgentIds.Count
+            TotalAtPeriodStart = $prev.AgentIds.Count
+            ScriptRunDate      = $ScriptRunDate
+        })
+    }
+}
+Write-Status "[M5] Deployment Velocity periods calculated: $($DeploymentVelocity.Count)" "Green"
+
+$h_Velocity = "PeriodStart,PeriodEnd,DaysBetweenSnaps,NewEndpoints,RemovedEndpoints,NetChange,TotalAtPeriodEnd,TotalAtPeriodStart,ScriptRunDate"
+Export-PowerBiCsv -Data $DeploymentVelocity -BaseName "DeploymentVelocity" -FallbackHeaders $h_Velocity
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+Write-Status "ComplianceGraceDays used: $ComplianceGraceDays days" "Cyan"
+Write-Status "========================================" "Cyan"
+Write-Status " SHOWCASE EXPORT COMPLETE" "Green"
+Write-Status "========================================" "Cyan"
+Write-Status "========================================" "Cyan"
+Write-Status " Run Date         -> $ScriptRunDate" "White"
+Write-Status "----------------------------------------" "Gray"
+Write-Status " Sets             -> $($AllSets.Count)" "White"
+Write-Status " Endpoints        -> $($MasterEndpoints.Count)" "White"
+Write-Status " Agent Ver Rows   -> $($AgentVersions.Count)  (includes _ALL_SETS global rows)" "White"
+Write-Status " Set Summary Rows -> $($SetSummary.Count)" "White"
+Write-Status " License Pools    -> $($LicensePools.Count)  (FP + CR)" "White"
+Write-Status " Velocity Periods -> $($DeploymentVelocity.Count)" "White"
+Write-Status "----------------------------------------" "Gray"
+Write-Status " RAG Thresholds  -> Amber >= $AmberThresholdPct%  |  Red >= $RedThresholdPct%" "White"
+Write-Status "----------------------------------------" "Gray"
+Write-Status " Latest\          -> $LatestDir" "White"
+Write-Status " Archive\         -> $ArchiveDir" "White"
+Write-Status " Log File         -> $LogFile" "White"
+Write-Status "========================================" "Cyan"
